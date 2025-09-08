@@ -1,0 +1,6 @@
+# requirements.txt
+streamlit
+gspread
+pandas
+pdfminer.six
+gspread-dataframe
