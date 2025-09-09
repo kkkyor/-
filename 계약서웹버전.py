@@ -1,78 +1,144 @@
 import streamlit as st
-import re
-from io import StringIO
-from pdfminer.high_level import extract_pages
-from pdfminer.layout import LTTextContainer
 import pandas as pd
 import gspread
-import urllib.parse
 from datetime import datetime
-from gspread_dataframe import set_with_dataframe
+import re
+from pdfminer.high_level import extract_pages
+from pdfminer.layout import LTTextContainer
 import urllib.parse
+import fitz  # PyMuPDF
+from PIL import Image
+import io
 
 # --------------------------------------------------------------------------
-# 1. 보내주신 PDF 추출 함수 (수정 없이 거의 그대로 사용)
+# 1. Google Sheets 연동 및 데이터 처리 함수
 # --------------------------------------------------------------------------
-def extract_specific_data_from_page2(pdf_path):
-    """
-    pdfminer.six를 사용하여 PDF 2페이지의 레이아웃을 분석하고,
-    특정 항목들의 값을 추출하여 딕셔너리로 반환합니다.
-    """
+
+# PDF를 이미지로 변환하는 함수 (새로 추가)
+# PDF를 이미지로 변환하는 함수 (기본 페이지 변경)
+def convert_pdf_page_to_image(pdf_bytes, page_number=1): # ◀️ 이 숫자를 0에서 1로 변경
+    """PDF 파일의 특정 페이지를 이미지 객체로 변환합니다."""
     try:
-        # 1. PDF 2페이지만 타겟으로 레이아웃 객체 추출
+        # 바이트 데이터로부터 PDF 문서 열기
+        pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
+        
+        # 페이지 수가 요청된 페이지 번호보다 적은 경우 처리
+        if len(pdf_document) <= page_number:
+            st.warning(f"'{page_number + 1}'번째 페이지가 존재하지 않아 첫 페이지를 표시합니다.")
+            page_number = 0
+            if len(pdf_document) == 0:
+                st.error("PDF에 페이지가 없습니다.")
+                return None
+
+        # 지정된 페이지 선택 (0은 첫 페이지, 1은 두 번째 페이지)
+        page = pdf_document.load_page(page_number)
+        
+        # 페이지를 이미지(pixmap)로 렌더링
+        pix = page.get_pixmap()
+        
+        # pixmap을 이미지 바이트로 변환
+        img_bytes = pix.tobytes("png")
+        
+        # 바이트 데이터로부터 Pillow 이미지 객체 생성
+        image = Image.open(io.BytesIO(img_bytes))
+        return image
+    except Exception as e:
+        # 오류 발생 시 None 반환
+        st.error(f"PDF를 이미지로 변환하는 중 오류 발생: {e}")
+        return None
+
+def connect_to_sheet():
+    """Google Sheets에 연결하고 워크시트 객체를 반환합니다."""
+    try:
+        gc = gspread.service_account(filename='credentials.json')
+        # gc = gspread.service_account_from_dict(st.secrets["gcp_service_account"])
+        spreadsheet = gc.open("계약관리DB") # 실제 스프레드시트 이름으로 변경
+        worksheet = spreadsheet.sheet1
+        return worksheet
+    except Exception as e:
+        st.error(f"Google Sheets 연결에 실패했습니다: {e}")
+        return None
+
+def get_data_as_dataframe(worksheet):
+    """워크시트 데이터를 Pandas DataFrame으로 불러오고 기본 전처리를 수행합니다."""
+    try:
+        # 데이터가 없는 경우를 대비하여 빈 데이터프레임 생성
+        data = worksheet.get_all_values()
+        if not data:
+            # 헤더만 있는 경우 또는 완전히 비어있는 경우
+            st.warning("시트에 데이터가 없습니다. 헤더를 확인해주세요.")
+            # 필수 헤더를 가진 빈 데이터프레임 반환
+            headers = ['담당자', '고객명', '계약접수처', '유입경로', '날짜', '접수처월별', '전체월별', '상태']
+            return pd.DataFrame(columns=headers)
+
+        header = data[0]
+        records = data[1:]
+        
+        # 필수 헤더 존재 여부 확인
+        required_headers = ['담당자', '날짜', '계약접수처']
+        for h in required_headers:
+            if h not in header:
+                st.error(f"시트의 첫 행에 필수 헤더 '{h}'가 없습니다. 확인해주세요.")
+                return None
+
+        df = pd.DataFrame(records, columns=header)
+        df['날짜'] = pd.to_datetime(df['날짜'], errors='coerce')
+        # 행 번호를 추적하기 위한 인덱스 추가 (시트의 실제 행 번호와 맞춤: 헤더 1행 + 데이터 1부터 시작)
+        df['row_index'] = range(2, len(df) + 2)
+        return df
+    except Exception as e:
+        st.error(f"데이터를 DataFrame으로 변환하는 중 오류 발생: {e}")
+        return None
+
+# --------------------------------------------------------------------------
+# 2. PDF 계약서 분석 함수 (기존 코드 활용)
+# --------------------------------------------------------------------------
+
+def extract_specific_data_from_page2(pdf_file):
+    """PDF 파일의 2페이지에서 지정된 데이터를 추출합니다."""
+    try:
         extracted_blocks = []
-        # page_numbers=[1]은 0-based 인덱싱으로 2페이지를 의미
-        for page_layout in extract_pages(pdf_path, page_numbers=[1]):
+        for page_layout in extract_pages(pdf_file, page_numbers=[1]):
             for element in page_layout:
                 if isinstance(element, LTTextContainer):
                     extracted_blocks.append({
                         'text': element.get_text().strip(),
-                        'bbox': element.bbox  # (x0, y0, x1, y1)
+                        'bbox': element.bbox
                     })
-
-        # 2. 추출할 목표 레이블 정의 (리스트 형태로 다중 레이블 지정 가능)
+        
         target_labels = {
             '고객명': ['고객명', '법인명'],
             '대여차종': ['대여차종'],
             '대여기간': ['대여기간'],
             '월대여료': ['월 대여료(VAT포함)(1)'],
-            # '차량 소비자 가격'과 '차량소비자 가격' 둘 다 찾도록 수정
             '차량 소비자 가격': ['차량 소비자 가격', '차량소비자 가격'],
             '보증금 / 선납금': ['보증금 / 선납금']
         }
         
         extracted_info = {}
-        Y_TOLERANCE = 5  # 같은 라인에 있는지 판단하기 위한 Y좌표 허용 오차
+        Y_TOLERANCE = 5
 
-        # 3. 레이블을 기준으로 값 찾기
         for key_name, label_list in target_labels.items():
-            found_value = "정보를 찾을 수 없음"
+            found_value = "정보 없음"
             label_bbox = None
-
-            # 레이블 텍스트 목록을 순회하며 일치하는 블록 찾기
             for label_text in label_list:
                 for block in extracted_blocks:
                     if label_text in block['text']:
                         label_bbox = block['bbox']
-                        break  # 블록 루프 탈출
+                        break
                 if label_bbox:
-                    break  # 레이블 목록 루프 탈출
+                    break
             
             if label_bbox:
                 label_x1, label_y0, _, label_y1 = label_bbox
                 potential_values = []
-                
-                # 레이블의 오른쪽에 있고, Y좌표가 비슷한 블록들을 후보로 추가
                 for block in extracted_blocks:
                     block_x0, block_y0, _, block_y1 = block['bbox']
-                    # y좌표의 중간값이 허용 오차 이내에 있고, x좌표가 레이블의 오른쪽에 있는지 확인
                     if block_x0 > label_x1 and abs(((label_y0 + label_y1) / 2) - ((block_y0 + block_y1) / 2)) < Y_TOLERANCE:
                         potential_values.append((block_x0, block['text']))
                 
-                # X좌표 기준으로 정렬하여 가장 가까운 값을 찾음
                 potential_values.sort(key=lambda item: item[0])
                 
-                # 키에 따라 값 추출 로직 분기
                 if key_name == '대여기간':
                     for _, text in potential_values:
                         if text.isdigit():
@@ -87,140 +153,343 @@ def extract_specific_data_from_page2(pdf_path):
                 elif key_name == '보증금 / 선납금':
                     money_values = []
                     for _, text in potential_values:
-                        # 숫자와 콤마로 이루어진 값만 찾음
                         matches = re.findall(r'\d{1,3}(?:,\d{3})*|\d+', text)
                         money_values.extend(matches)
-                    
                     if len(money_values) >= 2:
                         found_value = f"보증금: {money_values[0]} / 선납금: {money_values[1]}"
                     elif len(money_values) == 1:
                         found_value = f"보증금/선납금: {money_values[0]}"
-                
                 elif key_name == '대여차종':
                     if potential_values:
                         full_model_name = potential_values[0][1]
-                        # 요약 함수를 호출하여 모델명 단축
                         found_value = summarize_car_model(full_model_name)
-
-                else: # 고객명 등 나머지 항목
+                else:
                     if potential_values:
                         found_value = potential_values[0][1]
 
             extracted_info[key_name] = found_value
-            
         return extracted_info
-
     except Exception as e:
         return {"오류": str(e)}
 
 def summarize_car_model(full_model_name):
-    """
-    복잡한 차량 모델명에서 핵심적인 모델명만 추출하여 요약합니다.
-    예: "G80 (G)2.5T 18"/기본 2WD AT" -> "G80 (G)"
-    """
-    # 상세 스펙을 나타내는 패턴 목록
-    # 이 목록에 있는 키워드나 패턴이 처음 나타나는 위치에서 문자열을 자릅니다.
-    stop_patterns = [
-        r'\d\.\d',          # 엔진 배기량 (예: 2.5, 3.8)
-        r'\d{2}"',          # 휠 사이즈 (예: 18")
-        r'2WD', '4WD', 'AWD', # 구동 방식
-        r'\sAT', r'\sMT',   # 변속기
-        r'\/',              # 슬래시 구분자
-        '디젤', '가솔린', 'LPi', 'LPG', '하이브리드', '터보', # 연료/엔진 타입
-        '기본'              # '기본' 트림
-    ]
-
+    """차량 모델명을 간소화합니다."""
+    stop_patterns = [r'\d\.\d', r'\d{2}"', '2WD', '4WD', 'AWD', r'\sAT', r'\sMT', r'\/', '디젤', '가솔린', 'LPi', 'LPG', '하이브리드', '터보', '기본']
     first_cut_index = len(full_model_name)
-
-    # 각 패턴이 가장 먼저 나타나는 위치를 찾음
     for pattern in stop_patterns:
-        # re.search는 문자열 전체에서 패턴을 검색합니다.
         match = re.search(pattern, full_model_name)
         if match and match.start() < first_cut_index:
             first_cut_index = match.start()
-
-    # 가장 먼저 나타난 스펙 패턴 이전까지의 문자열을 공백 제거 후 반환
     return full_model_name[:first_cut_index].strip()
 
+# --------------------------------------------------------------------------
+# 3. UI 렌더링 함수
+# --------------------------------------------------------------------------
 
-# app.py에 있는 기존 update_spreadsheet_and_calculate_totals 함수를
-# 아래의 새로운 함수로 완전히 대체합니다.
-
-def update_spreadsheet_and_calculate_totals(extracted_data, user_inputs):
-    """
-    (개선된 버전) Google Sheet에 연결하여 월간 합산을 계산하고 새 데이터를 기록합니다.
-    시트가 비어있거나 헤더가 잘못된 경우를 방어합니다.
-    """
-    try:
-        # 1. Google Sheets API 인증
-        gc = gspread.service_account_from_dict(st.secrets["gcp_service_account"])
-        spreadsheet = gc.open("테스트0905")
-        worksheet = spreadsheet.sheet1
-
-        # 2. 헤더와 모든 데이터를 별도로 불러오기
-        header = worksheet.row_values(1)
-        records = worksheet.get_all_values()[1:] # 헤더를 제외한 실제 데이터
-
-        # ✨ 방어 코드 1: 필수 헤더가 존재하는지 먼저 확인
-        required_headers = ['날짜', '계약접수처']
-        for h in required_headers:
-            if h not in header:
-                return {"status": "error", "message": f"시트의 1행에 '{h}' 헤더가 없습니다. 헤더를 확인해주세요."}
-
-        # 3. Pandas DataFrame으로 변환 (헤더를 명시적으로 지정)
-        df = pd.DataFrame(records, columns=header)
-
-        # 4. 월간 합산 계산
-        current_date = datetime.now()
-        current_month = current_date.month
-
-        if not df.empty:
-            df['날짜'] = pd.to_datetime(df['날짜'], errors='coerce')
-            monthly_df = df[df['날짜'].dt.month == current_month]
+def show_login_screen():
+    """로그인 화면 UI를 표시합니다."""
+    st.title("📄 계약 처리 자동화 시스템")
+    st.subheader("담당자 이름을 입력해주세요.")
+    
+    sales_person = st.text_input("담당자 이름", key="login_name_input")
+    
+    if st.button("로그인", key="login_button"):
+        if sales_person:
+            st.session_state['logged_in'] = True
+            st.session_state['sales_person'] = sales_person
+            st.rerun()
         else:
-            monthly_df = pd.DataFrame()
+            st.warning("담당자 이름을 입력해야 합니다.")
 
-        # ✨ 방어 코드 2: 계산 시에도 헤더 존재 여부 재확인
-        total_monthly_count = len(monthly_df) + 1
+def show_main_app():
+    """메인 애플리케이션 화면 UI를 표시합니다."""
+    st.sidebar.header(f"👤 {st.session_state['sales_person']}님")
+    
+    mode = st.sidebar.radio(
+        "원하는 작업을 선택하세요.",
+        ('내 계약 조회', '신규 계약 등록', '계약 수정', '계약 취소')
+    )
+    
+    worksheet = connect_to_sheet()
+    if worksheet is None: return
+
+    df = get_data_as_dataframe(worksheet)
+    if df is None: return
+
+    # 담당자 이름으로 데이터 필터링 (활성 계약만)
+    user_df = df[(df['담당자'] == st.session_state['sales_person']) & (df['상태'] != '취소')]
+
+    if mode == '내 계약 조회':
+        view_contracts(user_df)
+    elif mode == '신규 계약 등록':
+        register_new_contract(worksheet, df)
+    elif mode == '계약 수정':
+        edit_contract(worksheet, user_df)
+    elif mode == '계약 취소':
+        cancel_contract(worksheet, user_df)
+
+    if st.sidebar.button("로그아웃"):
+        st.session_state['logged_in'] = False
+        st.rerun()
+
+
+def view_contracts(user_df):
+    """담당자의 계약 목록을 표시합니다."""
+    st.header("나의 계약 목록")
+    if user_df.empty:
+        st.info("등록된 계약이 없습니다.")
+    else:
+        # 화면에 표시할 컬럼만 선택
+        display_cols = ['날짜', '고객명', '계약접수처', '유입경로', '상태']
+        # user_df에 있는 컬럼만 필터링
+        display_cols = [col for col in display_cols if col in user_df.columns]
         
-        if '계약접수처' in monthly_df.columns:
-            office_monthly_df = monthly_df[monthly_df['계약접수처'] == user_inputs['reception_office']]
-            total_office_monthly_count = len(office_monthly_df) + 1
-        else:
-            # 헤더가 있지만 데이터가 없는 초기 상태일 경우
-            total_office_monthly_count = 1
+        # '날짜' 컬럼을 문자열로 변환하여 시간 정보 제거
+        df_display = user_df.copy()
+        df_display['날짜'] = df_display['날짜'].dt.strftime('%Y-%m-%d')
         
-        # 5. 시트에 추가할 새로운 행 데이터 생성 (헤더 순서에 맞게 리스트로)
-        new_row_list = [
-            user_inputs['sales_person'],
-            extracted_data.get('고객명', 'N/A'),
-            user_inputs['reception_office'],
-            user_inputs['inflow_channel'],
-            current_date.strftime("%Y-%m-%d"),
-            total_office_monthly_count,
-            total_monthly_count
-        ]
+        st.dataframe(df_display[display_cols], use_container_width=True)
 
-        # 6. 새로운 행을 시트에 추가
-        worksheet.append_row(new_row_list, value_input_option='USER_ENTERED')
+
+def register_new_contract(worksheet, all_df):
+    """신규 계약 등록 UI 및 로직을 처리합니다. (UI/UX 개선 버전, 집계 로직 수정)"""
+    st.header("신규 계약 등록")
+
+    # (UI Part 1: 등록 완료 후 메일 링크 표시 로직은 동일)
+    if 'generated_mail_url' in st.session_state:
+        st.success("✅ Google Sheet에 데이터가 성공적으로 기록되었습니다.")
+        st.markdown(f'<a href="{st.session_state.generated_mail_url}" target="_blank" style="display: inline-block; padding: 12px 24px; background-color: #0073e6; color: white; text-decoration: none; font-weight: bold; border-radius: 5px; font-size: 16px;">📬 웍스메일 작성창 열기</a>', unsafe_allow_html=True)
+        st.info("메일 작성을 완료했거나, 새 계약을 등록하려면 아래 버튼을 눌러주세요.")
         
-        return {
-            "status": "success",
-            "message": "Google Sheet에 데이터를 성공적으로 기록했습니다.",
-            "office_total": total_office_monthly_count,
-            "grand_total": total_monthly_count
-}
+        if st.button("🔄 새 계약 등록 시작하기", use_container_width=True):
+            del st.session_state.generated_mail_url
+            st.rerun()
+        return
 
-    except Exception as e:
-        # 더 구체적인 오류 메시지를 반환하도록 수정
-        return {"status": "error", "message": f"오류 발생: {type(e).__name__} - {str(e)}"}
+    # (UI Part 2: 계약 등록 폼 UI 부분은 동일)
+    reception_office_options = ["온라인신규", "온라인", "중고차신규", "중고차", "원큐", "노바딜", "현대캐피탈1", "현대캐피탈2", "기타"]
+    inflow_channel_options = ["온라인DB", "만기", "틱톡", "홈쇼핑", "지인", "기타"]
+    
+    reception_office = st.selectbox("계약접수처", reception_office_options)
+    inflow_channel = st.selectbox("유입경로", inflow_channel_options)
 
-def create_works_mail_url(extracted_data, user_inputs, calculated_totals):
-    """
-    추출된 데이터, 사용자 입력, 계산된 합산 값을 조합하여
-    Naver Works Mail 작성 URL을 생성합니다.
-    """
-    # URL에 들어갈 값들을 변수로 정리
+    col1, col2 = st.columns(2)
+    with col1:
+        is_additional = st.checkbox("추가")
+    with col2:
+        is_referral = st.checkbox("소개")
+
+    uploaded_file = st.file_uploader("계약서 PDF 파일을 업로드하세요.", type="pdf")
+
+    # (PDF 분석 및 폼 표시 로직은 동일)
+    if uploaded_file is not None:
+        if 'last_uploaded_filename' not in st.session_state or st.session_state.last_uploaded_filename != uploaded_file.name:
+            with st.spinner('계약서를 분석 중...'):
+                st.session_state.extracted_data = extract_specific_data_from_page2(uploaded_file)
+                st.session_state.last_uploaded_filename = uploaded_file.name
+                st.success("✅ 계약서 정보 추출 완료!")
+
+                
+                # 🔽🔽🔽 기존 st.expander 블록을 아래 코드로 교체하세요 🔽🔽🔽
+            with st.expander("📄 업로드된 계약서 미리보기 및 전체보기"):
+                # 업로드된 파일의 바이트 데이터를 가져옵니다.
+                pdf_bytes = uploaded_file.getvalue()
+                
+                # --- 1. 첫 페이지 이미지 미리보기 ---
+                st.markdown("##### 📄 두 번째 페이지 미리보기")
+                preview_image = convert_pdf_page_to_image(pdf_bytes)
+                
+                if preview_image:
+                    # [변경] use_column_width -> use_container_width
+                    st.image(preview_image, caption="계약서 두 번째 페이지", use_container_width=True)
+                else:
+                    st.warning("미리보기를 생성할 수 없습니다.")
+                
+                st.markdown("---")
+
+                # --- 2. [추가] 전체 파일을 새 탭에서 여는 다운로드 버튼 ---
+                st.markdown("##### 📑 전체 파일 열기")
+                st.download_button(
+                    label="클릭하여 전체 계약서 열기",
+                    data=pdf_bytes,
+                    file_name=uploaded_file.name,
+                    mime="application/pdf",
+                    use_container_width=True
+                )
+                # 🔼🔼🔼 여기까지 교체 🔼🔼🔼
+
+    if 'extracted_data' in st.session_state and st.session_state.extracted_data:
+        if "오류" in st.session_state.extracted_data:
+            st.error(f"PDF 분석 오류: {st.session_state.extracted_data['오류']}")
+            del st.session_state.extracted_data
+            return
+
+        st.subheader("📝 추출된 계약 정보 (수정 가능)")
+        
+        with st.form("edit_extracted_data_form"):
+            edited_data = {}
+            for key, value in st.session_state.extracted_data.items():
+                display_value = "" if value == "정보 없음" else value
+                edited_data[key] = st.text_input(f"**{key}**", value=display_value)
+            
+            st.markdown("---")
+            commission_input = st.text_input("💰 수수료")
+            incentive_input = st.text_input("🏆 인센티브")
+            # [추가] '투입일자'를 입력받는 text_input 위젯
+            delivery_date_input = st.text_input("📅 투입일자")
+
+
+            submit_button = st.form_submit_button("🚀 시트에 최종 등록하기", use_container_width=True)
+
+            if submit_button:
+                user_inputs = { "sales_person": st.session_state['sales_person'], "reception_office": reception_office, "inflow_channel": inflow_channel }
+                
+                with st.spinner('Google Sheet에 데이터를 기록하는 중...'):
+                    try:
+                        # --- 3. [핵심 변경] 계약 댓수 집계 방식 수정 ---
+                        current_date = datetime.now()
+                        sales_person_name = user_inputs['sales_person']
+
+                        # (1) 전체 데이터에서 현재 담당자 데이터만 필터링
+                        salesperson_df = all_df[all_df['담당자'] == sales_person_name]
+                        
+                        # (2) 담당자 데이터 내에서 현재 월 데이터 필터링
+                        current_month_salesperson_df = salesperson_df[salesperson_df['날짜'].dt.month == current_date.month]
+                        
+                        # (3) 담당자의 전체 월별 댓수 계산
+                        total_salesperson_monthly_count = len(current_month_salesperson_df) + 1
+
+                        # (4) 담당자의 접수처별 월별 댓수 계산
+                        office_monthly_salesperson_df = current_month_salesperson_df[current_month_salesperson_df['계약접수처'] == reception_office]
+                        total_office_salesperson_monthly_count = len(office_monthly_salesperson_df) + 1
+                        
+                        sheet_headers = worksheet.row_values(1)
+                        new_row_dict = {
+                            '담당자': sales_person_name,
+                            '고객명': edited_data.get('고객명', 'N/A'),
+                            '계약접수처': user_inputs['reception_office'],
+                            '유입경로': user_inputs['inflow_channel'],
+                            '날짜': current_date.strftime("%Y-%m-%d"),
+                            '접수처월별': total_office_salesperson_monthly_count, # 담당자 기준 접수처 댓수
+                            '전체월별': total_salesperson_monthly_count,      # 담당자 기준 전체 댓수
+                            '상태': '정상',
+                            '추가': "O" if is_additional else "",
+                            '소개': "O" if is_referral else ""
+                        }
+                        
+                        new_row_list = [new_row_dict.get(h, '') for h in sheet_headers]
+                        worksheet.append_row(new_row_list, value_input_option='USER_ENTERED')
+                        
+                        # [변경] mail_url 생성 시 체크박스 값(is_additional, is_referral) 전달
+                        mail_url = create_works_mail_url(
+                            edited_data, 
+                            user_inputs, {
+                                # 딕셔너리 키는 동일하게, 값은 담당자 기준으로 계산된 값으로 전달
+                                "office_total": total_office_salesperson_monthly_count,
+                                "grand_total": total_salesperson_monthly_count
+                            },
+                            commission=commission_input, 
+                            incentive=incentive_input,
+                            delivery_date=delivery_date_input, # ◀️ 추가된 부분
+                            is_additional=is_additional, # '추가' 체크 여부 전달
+                            is_referral=is_referral      # '소개' 체크 여부 전달
+                        )
+                        st.session_state.generated_mail_url = mail_url
+
+                        del st.session_state.extracted_data
+                        del st.session_state.last_uploaded_filename
+                        st.rerun()
+
+                    except Exception as e:
+                        st.error(f"Google Sheet 처리 중 오류 발생: {e}")
+
+def edit_contract(worksheet, user_df):
+    """계약 수정 UI 및 로직을 처리합니다."""
+    st.header("계약 수정")
+    if user_df.empty:
+        st.info("수정할 계약이 없습니다.")
+        return
+
+    # 선택을 위한 고유 식별자 생성
+    user_df['display'] = user_df.apply(lambda row: f"{row['날짜'].strftime('%Y-%m-%d')} / {row['고객명']}", axis=1)
+    
+    selected_contract_display = st.selectbox(
+        "수정할 계약을 선택하세요.",
+        user_df['display'],
+        index=None,
+        placeholder="계약 선택..."
+    )
+
+    if selected_contract_display:
+        selected_row = user_df[user_df['display'] == selected_contract_display].iloc[0]
+        row_to_edit_index = selected_row['row_index']
+
+        with st.form("edit_form"):
+            st.write(f"**고객명:** {selected_row['고객명']}")
+            
+            # 수정 가능한 필드들
+            new_reception_office = st.text_input("계약접수처", value=selected_row.get('계약접수처', ''))
+            new_inflow_channel = st.text_input("유입경로", value=selected_row.get('유입경로', ''))
+            
+            submitted = st.form_submit_button("수정 내용 저장")
+            if submitted:
+                try:
+                    # gspread는 1-based index를 사용합니다.
+                    # B, C, D... 열에 해당. A열(담당자)은 1, B열은 2...
+                    # 헤더를 기준으로 열 인덱스를 동적으로 찾기
+                    headers = worksheet.row_values(1)
+                    office_col = headers.index('계약접수처') + 1
+                    inflow_col = headers.index('유입경로') + 1
+
+                    worksheet.update_cell(row_to_edit_index, office_col, new_reception_office)
+                    worksheet.update_cell(row_to_edit_index, inflow_col, new_inflow_channel)
+                    
+                    st.success("계약 정보가 성공적으로 수정되었습니다.")
+                    st.info("페이지가 곧 새로고침됩니다.")
+                    st.rerun() # 수정 후 화면을 새로고침하여 최신 상태를 반영
+                except Exception as e:
+                    st.error(f"수정 중 오류가 발생했습니다: {e}")
+
+def cancel_contract(worksheet, user_df):
+    """계약 취소 UI 및 로직을 처리합니다."""
+    st.header("계약 취소")
+    if user_df.empty:
+        st.info("취소할 계약이 없습니다.")
+        return
+
+    user_df['display'] = user_df.apply(lambda row: f"{row['날짜'].strftime('%Y-%m-%d')} / {row['고객명']}", axis=1)
+    
+    selected_contract_display = st.selectbox(
+        "취소할 계약을 선택하세요.",
+        user_df['display'],
+        index=None,
+        placeholder="계약 선택..."
+    )
+
+    if selected_contract_display:
+        st.warning(f"**'{selected_contract_display}'** 계약을 정말 취소하시겠습니까? 이 작업은 되돌릴 수 없습니다.")
+        
+        if st.button("🔴 예, 계약을 취소합니다.", use_container_width=True):
+            selected_row = user_df[user_df['display'] == selected_contract_display].iloc[0]
+            row_to_cancel_index = selected_row['row_index']
+            
+            try:
+                headers = worksheet.row_values(1)
+                if '상태' not in headers:
+                    st.error("시트에 '상태' 컬럼이 없습니다. '상태' 컬럼을 추가해주세요.")
+                    return
+                
+                status_col = headers.index('상태') + 1
+                worksheet.update_cell(row_to_cancel_index, status_col, "취소")
+                st.success("계약이 성공적으로 취소 처리되었습니다.")
+                st.info("페이지가 곧 새로고침됩니다.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"취소 처리 중 오류가 발생했습니다: {e}")
+
+def create_works_mail_url(extracted_data, user_inputs, calculated_totals, commission, incentive, delivery_date, is_additional, is_referral):
+    """Naver Works Mail 작성 URL을 생성합니다. (투입일자 추가 버전)"""
+    # (기존 변수 선언은 동일)
     customer_name = extracted_data.get('고객명', '')
     car_model = extracted_data.get('대여차종', '')
     rental_period = extracted_data.get('대여기간', '')
@@ -235,108 +504,49 @@ def create_works_mail_url(extracted_data, user_inputs, calculated_totals):
     office_total = calculated_totals.get('office_total', 0)
     grand_total = calculated_totals.get('grand_total', 0)
 
-    # 1. 이메일 제목(Subject) 생성
-    subject = f"{sales_person} / {customer_name} / {reception_office} / {office_total} / {inflow_channel} / {grand_total}"
-
-    # 2. 이메일 본문(Body) 생성 (\n은 줄바꿈)
-    body = f"""고객명 : {customer_name}
-대여차종 : {car_model}
-수수료 : 
-대여기간 : {rental_period}
-차량 소비자 가격 : {car_price}
-월대여료 : {monthly_fee}
-보증금/선납금 : {deposit_prepayment}
-투입일자 : 
-인센티브 : """
-
-    # 3. Base URL 및 고정 수신자 정보
-    base_url = "https://mail.worksmobile.com/write/popup"
-    # 받는 사람 정보는 URL 인코딩이 필요할 수 있으므로 미리 변수로 지정
-    to_param = "문정동사서함 <automedia@automediarentcar.com>"
-
-    # 4. 최종 URL 조립 (한글 등 특수문자가 깨지지 않도록 URL 인코딩 필수!)
-    final_url = (
-        f"{base_url}"
-        f"?to={urllib.parse.quote(to_param)}"
-        f"&subject={urllib.parse.quote(subject)}"
-        f"&body={urllib.parse.quote(body)}"
-        f"&orderType=new&memo=false"
-    )
+    # (subject 생성 로직은 동일)
+    status_text = []
+    if is_additional:
+        status_text.append("추가")
+    if is_referral:
+        status_text.append("소개")
     
+    final_status = f" / { ' / '.join(status_text) }" if status_text else ""
+
+    subject = f"{sales_person} / {customer_name} / {reception_office} / {office_total} / {inflow_channel} / {grand_total}{final_status}"
+    
+    # [변경] body의 '투입일자' 항목에 전달받은 delivery_date 값을 채워 넣습니다.
+    body = f"""고객명 : {customer_name}
+            대여차종 : {car_model}
+            수수료 : {commission}
+            대여기간 : {rental_period}
+            차량 소비자 가격 : {car_price}
+            월대여료 : {monthly_fee}
+            보증금/선납금 : {deposit_prepayment}
+            투입일자 : {delivery_date}
+            인센티브 : {incentive}"""
+
+    # (URL 생성 로직은 동일)
+    base_url = "https://mail.worksmobile.com/write/popup"
+    to_param = "문정동사서함 <automedia@automediarentcar.com>"
+    
+    final_url = (f"{base_url}?to={urllib.parse.quote(to_param)}"
+                 f"&subject={urllib.parse.quote(subject)}"
+                 f"&body={urllib.parse.quote(body)}"
+                 f"&orderType=new&memo=false")
     return final_url
 
 # --------------------------------------------------------------------------
-# 2. Streamlit 웹 UI 구성
+# 4. Streamlit 앱 실행 로직
 # --------------------------------------------------------------------------
 st.set_page_config(page_title="계약 처리 자동화", layout="centered")
-st.title("📄 계약서 처리 및 메일 자동화")
 
-# 사이드바에 사용자 입력 필드 배치
-st.sidebar.header("📝 정보 입력")
-sales_person = st.sidebar.text_input("담당자 이름")
-reception_office = st.sidebar.text_input("계약접수처")
-inflow_channel = st.sidebar.text_input("유입경로")
+# 세션 상태 초기화
+if 'logged_in' not in st.session_state:
+    st.session_state['logged_in'] = False
 
-# 메인 화면에 파일 업로더 배치
-uploaded_file = st.file_uploader("계약서 PDF 파일을 업로드하세요.", type="pdf")
-
-process_button = st.button("🚀 처리 및 메일 링크 생성", use_container_width=True)
-
-# --------------------------------------------------------------------------
-# 3. 버튼 클릭 시 모든 로직 실행
-# --------------------------------------------------------------------------
-if process_button:
-    # 입력 값 검증
-    if not all([sales_person, reception_office, inflow_channel, uploaded_file]):
-        st.warning("모든 정보를 입력하고 파일을 업로드해주세요.")
-    else:
-        # 사용자 입력을 딕셔너리로 묶기
-        user_inputs = {
-            "sales_person": sales_person,
-            "reception_office": reception_office,
-            "inflow_channel": inflow_channel
-        }
-
-        with st.spinner('계약서를 분석하고 있습니다...'):
-            extracted_data = extract_specific_data_from_page2(uploaded_file)
-        
-        if "오류" in extracted_data:
-            st.error(f"PDF 분석 중 오류가 발생했습니다: {extracted_data['오류']}")
-        else:
-            st.success("✅ 계약서 정보 추출 완료!")
-            st.write(extracted_data)
-
-            # --- ✨ Google Sheet 연동 함수 호출! ---
-            with st.spinner('Google Sheet에 데이터를 기록하고 합산을 계산하는 중...'):
-                sheet_result = update_spreadsheet_and_calculate_totals(extracted_data, user_inputs)
-            
-            if sheet_result['status'] == 'success':
-                st.success(f"✅ {sheet_result['message']}")
-                
-                # ✨ --- URL 생성 및 링크 표시 로직 추가 ---
-                
-                # 1. 시트 함수에서 반환된 합산 값 저장
-                calculated_totals = {
-                    "office_total": sheet_result['office_total'],
-                    "grand_total": sheet_result['grand_total']
-                }
-                
-                # 2. URL 생성 함수 호출
-                mail_url = create_works_mail_url(extracted_data, user_inputs, calculated_totals)
-                
-                # 3. 클릭 가능한 링크(새 창)로 화면에 표시
-                st.markdown(f'''
-                <a href="{mail_url}" target="_blank" style="
-                    display: inline-block;
-                    padding: 10px 20px;
-                    background-color: #0073e6;
-                    color: white;
-                    text-decoration: none;
-                    font-weight: bold;
-                    border-radius: 5px;">
-                    📬 웍스메일 작성창 열기
-                </a>
-                ''', unsafe_allow_html=True)
-
-            else:
-                st.error(f"❗️ Google Sheet 처리 중 오류 발생:\n{sheet_result['message']}")
+# 로그인 상태에 따라 다른 화면 표시
+if st.session_state['logged_in']:
+    show_main_app()
+else:
+    show_login_screen()
