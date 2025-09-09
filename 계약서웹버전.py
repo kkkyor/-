@@ -6,7 +6,7 @@ import re
 from pdfminer.high_level import extract_pages
 from pdfminer.layout import LTTextContainer
 import urllib.parse
-import fitz  # PyMuPDF
+import fitz
 from PIL import Image
 import io
 
@@ -550,3 +550,4 @@ if st.session_state['logged_in']:
     show_main_app()
 else:
     show_login_screen()
+
