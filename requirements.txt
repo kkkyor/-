@@ -3,5 +3,7 @@ streamlit
 gspread
 pandas
 pdfminer.six
-fitz
+PyMuPDF
+Pillow
 gspread-dataframe
+
