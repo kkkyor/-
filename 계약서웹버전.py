@@ -50,8 +50,8 @@ def convert_pdf_page_to_image(pdf_bytes, page_number=1): # ◀️ 이 숫자를 
 def connect_to_sheet():
     """Google Sheets에 연결하고 워크시트 객체를 반환합니다."""
     try:
-        gc = gspread.service_account(filename='credentials.json')
-        # gc = gspread.service_account_from_dict(st.secrets["gcp_service_account"])
+        # gc = gspread.service_account(filename='credentials.json')
+        gc = gspread.service_account_from_dict(st.secrets["gcp_service_account"])
         spreadsheet = gc.open("계약관리DB") # 실제 스프레드시트 이름으로 변경
         worksheet = spreadsheet.sheet1
         return worksheet
@@ -792,3 +792,4 @@ if st.session_state['logged_in']:
     show_main_app()
 else:
     show_login_screen()
+
